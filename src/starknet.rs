@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
+use std::time::Instant;
 
 pub type SyscallResult<T> = std::result::Result<T, Vec<Felt>>;
 
@@ -1408,6 +1409,12 @@ pub(crate) mod handler {
             gas: &mut u64,
             input: &ArrayAbi<u64>,
         ) {
+            let hash_logs_enabled = crate::runtime::blockifier_hash_logs_enabled();
+            let log_start = if hash_logs_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let input_vec = unsafe {
                 let since_offset = input.since as usize;
                 let until_offset = input.until as usize;
@@ -1420,6 +1427,35 @@ pub(crate) mod handler {
             };
 
             let result = ptr.keccak(input_vec, gas);
+            if hash_logs_enabled {
+                let total_us = log_start.map(|s| s.elapsed().as_micros()).unwrap_or(0);
+                let values = input_vec
+                    .iter()
+                    .map(|v| format!("0x{:x}", v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match &result {
+                    Ok(x) => {
+                        let result_hex = format!("0x{:032x}{:032x}", x.hi, x.lo);
+                        let masked = Self::sn_keccak_masked_felt(x);
+                        crate::runtime::record_sn_keccak_origin(hash_logs_enabled, masked, &values);
+                        ::tracing::info!(
+                            "blockifier-cairo-native-exec: sn_keccak(keccak): cache-miss : values=[{}] : result={} : total_us={}",
+                            values,
+                            result_hex,
+                            total_us
+                        );
+                    }
+                    Err(err) => {
+                        ::tracing::info!(
+                            "blockifier-cairo-native-exec: sn_keccak(keccak): cache-miss : values=[{}] : error={:?} : total_us={}",
+                            values,
+                            err,
+                            total_us
+                        );
+                    }
+                }
+            }
             unsafe {
                 Self::drop_mlir_array(input);
             }
@@ -1433,6 +1469,14 @@ pub(crate) mod handler {
                 },
                 Err(e) => Self::wrap_error(&e),
             };
+        }
+
+        fn sn_keccak_masked_felt(value: &U256) -> Option<Felt> {
+            let mut bytes = [0u8; 32];
+            bytes[..16].copy_from_slice(&value.hi.to_be_bytes());
+            bytes[16..].copy_from_slice(&value.lo.to_be_bytes());
+            bytes[0] &= 0x03; // keep 250 LSBs (mask out top 6 bits)
+            Some(Felt::from_bytes_be(&bytes))
         }
 
         extern "C" fn wrap_secp256k1_new(

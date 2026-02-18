@@ -17,7 +17,7 @@ use starknet_types_core::{
 };
 use std::{
     alloc::{dealloc, realloc, Layout},
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{hash_map::Entry, HashMap},
     ffi::{c_int, c_void},
     fs::File,
@@ -27,6 +27,8 @@ use std::{
     os::fd::FromRawFd,
     ptr,
     rc::Rc,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Instant,
 };
 use std::{ops::Mul, vec::IntoIter};
 
@@ -37,6 +39,286 @@ lazy_static! {
     .unwrap();
     pub static ref DICT_GAS_REFUND_PER_ACCESS: u64 =
         (DICT_SQUASH_UNIQUE_KEY_COST.cost() - DICT_SQUASH_REPEATED_ACCESS_COST.cost()) as u64;
+
+    // Debug-only: enable pedersen call logs when investigating hashing hot paths.
+    // e.g. `export CAIRO_NATIVE_PEDERSEN_LOGS=1`
+    static ref CAIRO_NATIVE_PEDERSEN_LOGS: bool = {
+        let value = std::env::var("CAIRO_NATIVE_PEDERSEN_LOGS").unwrap_or_default();
+        if value.is_empty() {
+            return false;
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => false,
+            _ => true,
+        }
+    };
+
+    // Enable/disable the Pedersen memoization cache.
+    // e.g. `export CAIRO_NATIVE_PEDERSEN_CACHE=false`
+    //
+    // Default: enabled (same behavior as before this toggle existed).
+    static ref CAIRO_NATIVE_PEDERSEN_CACHE: bool = {
+        let value = std::env::var("CAIRO_NATIVE_PEDERSEN_CACHE").unwrap_or_default();
+        if value.is_empty() {
+            return true;
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => false,
+            _ => true,
+        }
+    };
+
+    static ref BLOCKIFIER_HASH_LOGS_ENABLED: bool = std::env::var_os("BLOCKIFIER_HASH_LOGS").is_some();
+    static ref BLOCKIFIER_STORAGE_LOGS_ENABLED: bool = std::env::var_os("BLOCKIFIER_STORAGE_LOGS").is_some();
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct NativeHashTiming {
+    pub pedersen_total_us: u128,
+    pub pedersen_hash_us: u128,
+    pub poseidon_total_us: u128,
+    pub poseidon_hash_us: u128,
+    pub pedersen_calls: u64,
+    pub poseidon_calls: u64,
+}
+
+static HASH_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
+static EXEC_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
+static GLOBAL_PEDERSEN_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PEDERSEN_HASH_US: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_PEDERSEN_CALLS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_POSEIDON_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_POSEIDON_HASH_US: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_POSEIDON_CALLS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static HASH_TIMING: RefCell<NativeHashTiming> = RefCell::new(NativeHashTiming::default());
+    static EXEC_START: RefCell<Option<Instant>> = RefCell::new(None);
+    static PEDERSEN_CACHE: RefCell<HashMap<(Felt, Felt), Felt>> = RefCell::new(HashMap::new());
+    static PEDERSEN_RESULT_CACHE: RefCell<HashMap<Felt, (Felt, Felt)>> = RefCell::new(HashMap::new());
+    static SN_KECCAK_ORIGIN_CACHE: RefCell<HashMap<Felt, String>> = RefCell::new(HashMap::new());
+}
+
+/// Memoize Pedersen results because storage-key derivation repeatedly hashes the same (lhs,rhs)
+/// pairs across settle_trade_v3 transactions (and many other workloads).
+///
+/// Thread-local to avoid locking; capacity is bounded to avoid unbounded growth.
+const PEDERSEN_CACHE_CAPACITY: usize = 8 * 1024;
+const PEDERSEN_RESULT_CACHE_CAPACITY: usize = 8 * 1024;
+const SN_KECCAK_ORIGIN_CACHE_CAPACITY: usize = 8 * 1024;
+
+#[inline]
+pub fn start_hash_timing() {
+    HASH_TIMING_ENABLED.store(true, Ordering::Relaxed);
+    HASH_TIMING.with(|t| *t.borrow_mut() = NativeHashTiming::default());
+    GLOBAL_PEDERSEN_TOTAL_US.store(0, Ordering::Relaxed);
+    GLOBAL_PEDERSEN_HASH_US.store(0, Ordering::Relaxed);
+    GLOBAL_PEDERSEN_CALLS.store(0, Ordering::Relaxed);
+    GLOBAL_POSEIDON_TOTAL_US.store(0, Ordering::Relaxed);
+    GLOBAL_POSEIDON_HASH_US.store(0, Ordering::Relaxed);
+    GLOBAL_POSEIDON_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn stop_hash_timing() -> NativeHashTiming {
+    let timing = HASH_TIMING.with(|t| t.borrow().clone());
+    HASH_TIMING_ENABLED.store(false, Ordering::Relaxed);
+    timing
+}
+
+#[inline]
+pub fn stop_hash_timing_global() -> NativeHashTiming {
+    let timing = NativeHashTiming {
+        pedersen_total_us: GLOBAL_PEDERSEN_TOTAL_US.swap(0, Ordering::Relaxed) as u128,
+        pedersen_hash_us: GLOBAL_PEDERSEN_HASH_US.swap(0, Ordering::Relaxed) as u128,
+        poseidon_total_us: GLOBAL_POSEIDON_TOTAL_US.swap(0, Ordering::Relaxed) as u128,
+        poseidon_hash_us: GLOBAL_POSEIDON_HASH_US.swap(0, Ordering::Relaxed) as u128,
+        pedersen_calls: GLOBAL_PEDERSEN_CALLS.swap(0, Ordering::Relaxed),
+        poseidon_calls: GLOBAL_POSEIDON_CALLS.swap(0, Ordering::Relaxed),
+    };
+    timing
+}
+
+#[inline]
+pub fn hash_timing_enabled() -> bool {
+    HASH_TIMING_ENABLED.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn hash_timing_snapshot() -> NativeHashTiming {
+    HASH_TIMING.with(|t| t.borrow().clone())
+}
+
+#[inline]
+pub(crate) fn blockifier_hash_logs_enabled() -> bool {
+    *BLOCKIFIER_HASH_LOGS_ENABLED
+}
+
+#[inline]
+pub(crate) fn blockifier_storage_logs_enabled() -> bool {
+    *BLOCKIFIER_STORAGE_LOGS_ENABLED
+}
+
+#[inline]
+fn hash_log_start(enabled: bool) -> Option<Instant> {
+    if enabled {
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn log_pedersen_hash(
+    enabled: bool,
+    start: Option<Instant>,
+    cache_hit: bool,
+    lhs: Felt,
+    rhs: Felt,
+    result: Felt,
+) {
+    if !enabled {
+        return;
+    }
+    let total_us = start.map(|s| s.elapsed().as_micros()).unwrap_or(0);
+    let cache = if cache_hit { "cache-hit" } else { "cache-miss" };
+    maybe_log_pedersen_left_origin(lhs);
+    maybe_log_sn_keccak_left_origin(lhs);
+    ::tracing::info!(
+        "blockifier-cairo-native-exec: pedersen(hash): {} : left={:#x} right={:#x} : result={:#x} : total_us={}",
+        cache,
+        lhs,
+        rhs,
+        result,
+        total_us
+    );
+}
+
+#[inline]
+fn maybe_log_pedersen_left_origin(lhs: Felt) {
+    if PEDERSEN_RESULT_CACHE.with(|cache| cache.borrow().is_empty()) {
+        return;
+    }
+    let origin = PEDERSEN_RESULT_CACHE.with(|cache| cache.borrow().get(&lhs).copied());
+    if let Some((from_left, from_right)) = origin {
+        ::tracing::info!(
+            "blockifier-cairo-native-exec: pedersen(left_origin): left={:#x} from_left={:#x} from_right={:#x}",
+            lhs,
+            from_left,
+            from_right
+        );
+    }
+}
+
+#[inline]
+fn record_pedersen_origin(enabled: bool, lhs: Felt, rhs: Felt, result: Felt) {
+    if !enabled {
+        return;
+    }
+    PEDERSEN_RESULT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= PEDERSEN_RESULT_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(result, (lhs, rhs));
+    });
+}
+
+#[inline]
+pub(crate) fn record_sn_keccak_origin(enabled: bool, masked: Option<Felt>, values: &str) {
+    if !enabled {
+        return;
+    }
+    let Some(key) = masked else {
+        return;
+    };
+    SN_KECCAK_ORIGIN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= SN_KECCAK_ORIGIN_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(key, values.to_string());
+    });
+}
+
+#[inline]
+fn maybe_log_sn_keccak_left_origin(lhs: Felt) {
+    let origin = SN_KECCAK_ORIGIN_CACHE.with(|cache| cache.borrow().get(&lhs).cloned());
+    if let Some(values) = origin {
+        ::tracing::info!(
+            "blockifier-cairo-native-exec: pedersen(left_origin_sn_keccak): left={:#x} values=[{}]",
+            lhs,
+            values
+        );
+    }
+}
+
+#[inline]
+fn log_poseidon_hash(
+    enabled: bool,
+    start: Option<Instant>,
+    before: [Felt; 3],
+    after: [Felt; 3],
+) {
+    if !enabled {
+        return;
+    }
+    let total_us = start.map(|s| s.elapsed().as_micros()).unwrap_or(0);
+    ::tracing::info!(
+        "blockifier-cairo-native-exec: poseidon(hades_permutation): cache-miss : values=[{:#x}, {:#x}, {:#x}] : result=[{:#x}, {:#x}, {:#x}] : total_us={}",
+        before[0],
+        before[1],
+        before[2],
+        after[0],
+        after[1],
+        after[2],
+        total_us
+    );
+}
+
+#[inline]
+pub fn start_exec_timing() {
+    EXEC_TIMING_ENABLED.store(true, Ordering::Relaxed);
+    EXEC_START.with(|t| *t.borrow_mut() = Some(Instant::now()));
+}
+
+#[inline]
+pub fn stop_exec_timing() -> u128 {
+    let elapsed = EXEC_START.with(|t| t.borrow().map(|s| s.elapsed()).unwrap_or_default());
+    EXEC_TIMING_ENABLED.store(false, Ordering::Relaxed);
+    elapsed.as_micros()
+}
+
+#[inline]
+fn record_pedersen_hash(total_us: u128, hash_us: u128) {
+    if !hash_timing_enabled() {
+        return;
+    }
+    HASH_TIMING.with(|t| {
+        let mut timing = t.borrow_mut();
+        timing.pedersen_total_us += total_us;
+        timing.pedersen_hash_us += hash_us;
+        timing.pedersen_calls += 1;
+    });
+    GLOBAL_PEDERSEN_TOTAL_US.fetch_add(total_us as u64, Ordering::Relaxed);
+    GLOBAL_PEDERSEN_HASH_US.fetch_add(hash_us as u64, Ordering::Relaxed);
+    GLOBAL_PEDERSEN_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_poseidon_hash(total_us: u128, hash_us: u128) {
+    if !hash_timing_enabled() {
+        return;
+    }
+    HASH_TIMING.with(|t| {
+        let mut timing = t.borrow_mut();
+        timing.poseidon_total_us += total_us;
+        timing.poseidon_hash_us += hash_us;
+        timing.poseidon_calls += 1;
+    });
+    GLOBAL_POSEIDON_TOTAL_US.fetch_add(total_us as u64, Ordering::Relaxed);
+    GLOBAL_POSEIDON_HASH_US.fetch_add(hash_us as u64, Ordering::Relaxed);
+    GLOBAL_POSEIDON_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Based on `cairo-lang-runner`'s implementation.
@@ -91,6 +373,12 @@ pub unsafe extern "C" fn cairo_native__libfunc__pedersen(
     lhs: &[u8; 32],
     rhs: &[u8; 32],
 ) {
+    let total_start = if hash_timing_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
+
     // Extract arrays from the pointers.
     let mut lhs = *lhs;
     let mut rhs = *rhs;
@@ -102,9 +390,59 @@ pub unsafe extern "C" fn cairo_native__libfunc__pedersen(
     let lhs = Felt::from_bytes_le(&lhs);
     let rhs = Felt::from_bytes_le(&rhs);
 
+    let hash_logs_enabled = blockifier_hash_logs_enabled();
+    let log_start = hash_log_start(hash_logs_enabled);
+
+    if *CAIRO_NATIVE_PEDERSEN_CACHE {
+        // Fast path: cache hit. This keeps semantics identical and avoids repeated Pedersen work.
+        // On a cache hit, hash_us is 0 (we didn't do the expensive hashing).
+        if let Some(res) = PEDERSEN_CACHE.with(|cache| cache.borrow().get(&(lhs, rhs)).copied()) {
+            *dst = res.to_bytes_le();
+            log_pedersen_hash(hash_logs_enabled, log_start, true, lhs, rhs, res);
+            record_pedersen_origin(hash_logs_enabled, lhs, rhs, res);
+            if let Some(start) = total_start {
+                let total_us = start.elapsed().as_micros();
+                record_pedersen_hash(total_us, 0);
+            }
+            return;
+        }
+    }
+
+    if *CAIRO_NATIVE_PEDERSEN_LOGS {
+        ::tracing::info!(
+            "blockifier-cairo-native-exec: pedersen(hash): debug : left={:?} right={:?}",
+            lhs,
+            rhs
+        );
+    }
+
     // Compute pedersen hash and copy the result into `dst`.
+    let hash_start = if total_start.is_some() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let res = starknet_types_core::hash::Pedersen::hash(&lhs, &rhs);
+    let hash_us = hash_start.map(|s| s.elapsed().as_micros()).unwrap_or(0);
     *dst = res.to_bytes_le();
+
+    if *CAIRO_NATIVE_PEDERSEN_CACHE {
+        PEDERSEN_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= PEDERSEN_CACHE_CAPACITY {
+                cache.clear();
+            }
+            cache.insert((lhs, rhs), res);
+        });
+    }
+
+    log_pedersen_hash(hash_logs_enabled, log_start, false, lhs, rhs, res);
+    record_pedersen_origin(hash_logs_enabled, lhs, rhs, res);
+
+    if let Some(start) = total_start {
+        let total_us = start.elapsed().as_micros();
+        record_pedersen_hash(total_us, hash_us);
+    }
 }
 
 /// Compute `hades_permutation(op0, op1, op2)` and replace the operands with the results.
@@ -124,6 +462,12 @@ pub unsafe extern "C" fn cairo_native__libfunc__hades_permutation(
     op1: &mut [u8; 32],
     op2: &mut [u8; 32],
 ) {
+    let total_start = if hash_timing_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    };
+
     op0[31] &= 0x0F; // Filter out first 4 bits (they're outside an i252).
     op1[31] &= 0x0F; // Filter out first 4 bits (they're outside an i252).
     op2[31] &= 0x0F; // Filter out first 4 bits (they're outside an i252).
@@ -135,13 +479,48 @@ pub unsafe extern "C" fn cairo_native__libfunc__hades_permutation(
         Felt::from_bytes_le(op2),
     ];
 
+    let hash_logs_enabled = blockifier_hash_logs_enabled();
+    let log_start = hash_log_start(hash_logs_enabled);
+    let values_before = state;
+
     // Compute Poseidon permutation.
+    let hash_start = if total_start.is_some() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     starknet_types_core::hash::Poseidon::hades_permutation(&mut state);
+    let hash_us = hash_start.map(|s| s.elapsed().as_micros()).unwrap_or(0);
 
     // Write back the results.
     *op0 = state[0].to_bytes_le();
     *op1 = state[1].to_bytes_le();
     *op2 = state[2].to_bytes_le();
+
+    log_poseidon_hash(hash_logs_enabled, log_start, values_before, state);
+
+    if let Some(start) = total_start {
+        let total_us = start.elapsed().as_micros();
+        record_poseidon_hash(total_us, hash_us);
+    }
+}
+
+/// Debug-only: log a storage base address derived from a felt252.
+///
+/// # Safety
+/// This function is intended to be called from MLIR and uses raw pointers.
+pub unsafe extern "C" fn cairo_native__log_storage_base_from_felt(value: &[u8; 32]) {
+    if !blockifier_storage_logs_enabled() {
+        return;
+    }
+    let mut raw = *value;
+    raw[31] &= 0x0F; // i252 mask
+    let felt = Felt::from_bytes_le(&raw);
+    ::tracing::info!(
+        target: "blockifier-cairo-native-exec",
+        "blockifier-cairo-native-exec: storage_base_address_from_felt252: value=0x{:x}",
+        felt
+    );
 }
 
 /// Felt252 type used in cairo native runtime

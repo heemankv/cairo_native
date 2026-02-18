@@ -33,6 +33,7 @@ use std::{
 enum RuntimeBinding {
     Pedersen,
     HadesPermutation,
+    StorageBaseAddressFromFeltLog,
     EcStateTryFinalizeNz,
     EcStateAddMul,
     EcStateInit,
@@ -58,6 +59,9 @@ impl RuntimeBinding {
             RuntimeBinding::DebugPrint => "cairo_native__libfunc__debug__print",
             RuntimeBinding::Pedersen => "cairo_native__libfunc__pedersen",
             RuntimeBinding::HadesPermutation => "cairo_native__libfunc__hades_permutation",
+            RuntimeBinding::StorageBaseAddressFromFeltLog => {
+                "cairo_native__log_storage_base_from_felt"
+            }
             RuntimeBinding::EcStateTryFinalizeNz => {
                 "cairo_native__libfunc__ec__ec_state_try_finalize_nz"
             }
@@ -97,6 +101,9 @@ impl RuntimeBinding {
             }
             RuntimeBinding::HadesPermutation => {
                 crate::runtime::cairo_native__libfunc__hades_permutation as *const ()
+            }
+            RuntimeBinding::StorageBaseAddressFromFeltLog => {
+                crate::runtime::cairo_native__log_storage_base_from_felt as *const ()
             }
             RuntimeBinding::EcStateTryFinalizeNz => {
                 crate::runtime::cairo_native__libfunc__ec__ec_state_try_finalize_nz as *const ()
@@ -373,6 +380,34 @@ impl RuntimeBindingsMeta {
             OperationBuilder::new("llvm.call", location)
                 .add_operands(&[function])
                 .add_operands(&[op0_ptr, op1_ptr, op2_ptr])
+                .build()?,
+        ))
+    }
+
+    /// Register if necessary, then invoke the storage base log helper.
+    pub fn libfunc_log_storage_base_from_felt<'c, 'a>(
+        &mut self,
+        context: &'c Context,
+        module: &Module,
+        block: &'a Block<'c>,
+        value_ptr: Value<'c, '_>,
+        location: Location<'c>,
+    ) -> Result<OperationRef<'c, 'a>>
+    where
+        'c: 'a,
+    {
+        let function = self.build_function(
+            context,
+            module,
+            block,
+            location,
+            RuntimeBinding::StorageBaseAddressFromFeltLog,
+        )?;
+
+        Ok(block.append_operation(
+            OperationBuilder::new("llvm.call", location)
+                .add_operands(&[function])
+                .add_operands(&[value_ptr])
                 .build()?,
         ))
     }
@@ -786,6 +821,7 @@ pub fn setup_runtime(find_symbol_ptr: impl Fn(&str) -> Option<*mut c_void>) {
         RuntimeBinding::DebugPrint,
         RuntimeBinding::Pedersen,
         RuntimeBinding::HadesPermutation,
+        RuntimeBinding::StorageBaseAddressFromFeltLog,
         RuntimeBinding::EcStateTryFinalizeNz,
         RuntimeBinding::EcStateAddMul,
         RuntimeBinding::EcStateInit,

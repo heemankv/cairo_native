@@ -22,7 +22,6 @@ use cairo_lang_sierra::{
     program::GenericArg,
     program_registry::ProgramRegistry,
 };
-use lazy_static::lazy_static;
 use melior::{
     dialect::llvm::{self, r#type::pointer},
     helpers::{ArithBlockExt, BuiltinBlockExt, LlvmBlockExt},
@@ -31,52 +30,6 @@ use melior::{
 };
 use num_bigint::{BigUint, Sign};
 use num_traits::Num;
-
-lazy_static! {
-    static ref BLOCKIFIER_STORAGE_LOGS_ENABLED: bool = std::env::var_os("BLOCKIFIER_STORAGE_LOGS").is_some();
-    static ref BLOCKIFIER_STORAGE_WATCH_FELT: Option<BigUint> = {
-        let raw = match std::env::var("BLOCKIFIER_STORAGE_WATCH_FELT") {
-            Ok(value) => value,
-            Err(_) => return None,
-        };
-        let value = raw.trim();
-        if value.is_empty() {
-            return None;
-        }
-        if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
-            BigUint::from_str_radix(hex, 16).ok()
-        } else {
-            BigUint::from_str_radix(value, 10).ok()
-        }
-    };
-}
-
-fn storage_logs_enabled() -> bool {
-    *BLOCKIFIER_STORAGE_LOGS_ENABLED
-}
-
-fn watch_felt_value() -> Option<BigUint> {
-    BLOCKIFIER_STORAGE_WATCH_FELT.clone()
-}
-
-fn maybe_log_const_value(kind: &str, value: &BigUint) {
-    if !storage_logs_enabled() {
-        return;
-    }
-    let Some(watch) = watch_felt_value() else {
-        return;
-    };
-    if &watch != value {
-        return;
-    }
-    let hex = value.to_str_radix(16);
-    ::tracing::info!(
-        target: "blockifier-cairo-native-exec",
-        "blockifier-cairo-native-exec: const_value(kind={}): value=0x{}",
-        kind,
-        hex
-    );
-}
 
 /// Select and call the correct libfunc builder function from the selector.
 pub fn build<'ctx, 'this>(
@@ -314,7 +267,6 @@ pub fn build_const_type_value<'ctx, 'this>(
                 _ => value,
             };
 
-            maybe_log_const_value("felt252", &value);
             Ok(entry.const_int_from_type(context, location, value, inner_ty)?)
         }
         CoreTypeConcrete::Starknet(
@@ -334,7 +286,6 @@ pub fn build_const_type_value<'ctx, 'this>(
                 _ => value,
             };
 
-            maybe_log_const_value("starknet", &value);
             Ok(entry.const_int_from_type(context, location, value, inner_ty)?)
         }
         CoreTypeConcrete::Uint8(_)

@@ -4,7 +4,7 @@ use super::LibfuncHelper;
 use crate::{
     error::{Error, Result},
     ffi::get_struct_field_type_at,
-    metadata::{drop_overrides::DropOverridesMeta, runtime_bindings::RuntimeBindingsMeta, MetadataStorage},
+    metadata::{drop_overrides::DropOverridesMeta, MetadataStorage},
     starknet::handler::StarknetSyscallHandlerCallbacks,
     utils::{get_integer_layout, ProgramRegistryExt, PRIME},
 };
@@ -816,17 +816,6 @@ pub fn build_storage_base_address_const<'ctx, 'this>(
     _metadata: &mut MetadataStorage,
     info: &SignatureAndConstConcreteLibfunc,
 ) -> Result<()> {
-    if crate::runtime::blockifier_storage_logs_enabled() {
-        let value_big = match info.c.sign() {
-            Sign::Minus => &*PRIME - info.c.magnitude(),
-            _ => info.c.magnitude().clone(),
-        };
-        tracing::info!(
-            target: "blockifier-cairo-native-exec",
-            "blockifier-cairo-native-exec: storage_base_address_const: value=0x{:x}",
-            value_big
-        );
-    }
     let value = entry.const_int(
         context,
         location,
@@ -879,26 +868,6 @@ pub fn build_storage_base_address_from_felt252<'ctx, 'this>(
         limited_value,
         location,
     ))?;
-
-    if crate::runtime::blockifier_storage_logs_enabled() {
-        let i256_ty = IntegerType::new(context, 256).into();
-        let layout_i256 = get_integer_layout(256);
-        let value_ptr = helper
-            .init_block()
-            .alloca1(context, location, i256_ty, layout_i256.align())?;
-        let value_i256 = entry.extui(value, i256_ty, location)?;
-        entry.store(context, location, value_ptr, value_i256)?;
-
-        if let Some(runtime_bindings) = metadata.get_mut::<RuntimeBindingsMeta>() {
-            runtime_bindings.libfunc_log_storage_base_from_felt(
-                context,
-                helper,
-                entry,
-                value_ptr,
-                location,
-            )?;
-        }
-    }
 
     helper.br(entry, 0, &[range_check, value], location)
 }

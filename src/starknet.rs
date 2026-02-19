@@ -1426,6 +1426,7 @@ pub(crate) mod handler {
                 }
             };
 
+            crate::runtime::record_sn_keccak_calc(input_vec);
             let result = ptr.keccak(input_vec, gas);
             if hash_logs_enabled {
                 let total_us = log_start.map(|s| s.elapsed().as_micros()).unwrap_or(0);

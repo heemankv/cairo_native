@@ -18,7 +18,7 @@ use starknet_types_core::{
 use std::{
     alloc::{dealloc, realloc, Layout},
     cell::{Cell, RefCell},
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, HashSet},
     ffi::{c_int, c_void},
     fs::File,
     io::Write,
@@ -70,6 +70,16 @@ lazy_static! {
 
     static ref BLOCKIFIER_HASH_LOGS_ENABLED: bool = std::env::var_os("BLOCKIFIER_HASH_LOGS").is_some();
     static ref BLOCKIFIER_STORAGE_LOGS_ENABLED: bool = std::env::var_os("BLOCKIFIER_STORAGE_LOGS").is_some();
+    static ref HASH_CALC_TOTALS_ENABLED: bool = {
+        let value = std::env::var("LOG_HASH_CALC_TOTALS").unwrap_or_default();
+        if value.is_empty() {
+            return false;
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => false,
+            _ => true,
+        }
+    };
 }
 
 #[derive(Debug, Default, Clone)]
@@ -80,6 +90,20 @@ pub struct NativeHashTiming {
     pub poseidon_hash_us: u128,
     pub pedersen_calls: u64,
     pub poseidon_calls: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HashCalcTotals {
+    pub pedersen: u64,
+    pub sn_keccak: u64,
+    pub poseidon: u64,
+}
+
+#[derive(Default)]
+struct HashCalcUniques {
+    pedersen: HashSet<(Felt, Felt)>,
+    sn_keccak: HashSet<Vec<u64>>,
+    poseidon: HashSet<Vec<Felt>>,
 }
 
 static HASH_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -97,6 +121,8 @@ thread_local! {
     static PEDERSEN_CACHE: RefCell<HashMap<(Felt, Felt), Felt>> = RefCell::new(HashMap::new());
     static PEDERSEN_RESULT_CACHE: RefCell<HashMap<Felt, (Felt, Felt)>> = RefCell::new(HashMap::new());
     static SN_KECCAK_ORIGIN_CACHE: RefCell<HashMap<Felt, String>> = RefCell::new(HashMap::new());
+    static HASH_CALC_TOTALS: RefCell<HashCalcTotals> = RefCell::new(HashCalcTotals::default());
+    static HASH_CALC_UNIQUES: RefCell<HashCalcUniques> = RefCell::new(HashCalcUniques::default());
 }
 
 /// Memoize Pedersen results because storage-key derivation repeatedly hashes the same (lhs,rhs)
@@ -137,6 +163,86 @@ pub fn stop_hash_timing_global() -> NativeHashTiming {
         poseidon_calls: GLOBAL_POSEIDON_CALLS.swap(0, Ordering::Relaxed),
     };
     timing
+}
+
+#[inline]
+pub fn hash_calc_totals_enabled() -> bool {
+    *HASH_CALC_TOTALS_ENABLED
+}
+
+#[inline]
+pub fn reset_hash_calc_stats() {
+    if !hash_calc_totals_enabled() {
+        return;
+    }
+    HASH_CALC_TOTALS.with(|stats| {
+        *stats.borrow_mut() = HashCalcTotals::default();
+    });
+    HASH_CALC_UNIQUES.with(|uniques| {
+        let mut uniques = uniques.borrow_mut();
+        uniques.pedersen.clear();
+        uniques.sn_keccak.clear();
+        uniques.poseidon.clear();
+    });
+}
+
+#[inline]
+pub fn hash_calc_totals_snapshot() -> HashCalcTotals {
+    HASH_CALC_TOTALS.with(|stats| *stats.borrow())
+}
+
+#[inline]
+pub fn hash_calc_unique_counts() -> HashCalcTotals {
+    HASH_CALC_UNIQUES.with(|uniques| {
+        let uniques = uniques.borrow();
+        HashCalcTotals {
+            pedersen: uniques.pedersen.len() as u64,
+            sn_keccak: uniques.sn_keccak.len() as u64,
+            poseidon: uniques.poseidon.len() as u64,
+        }
+    })
+}
+
+#[inline]
+fn record_pedersen_calc(lhs: Felt, rhs: Felt) {
+    if !hash_calc_totals_enabled() {
+        return;
+    }
+    HASH_CALC_TOTALS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        stats.pedersen = stats.pedersen.saturating_add(1);
+    });
+    HASH_CALC_UNIQUES.with(|uniques| {
+        uniques.borrow_mut().pedersen.insert((lhs, rhs));
+    });
+}
+
+#[inline]
+fn record_poseidon_calc(values: &[Felt]) {
+    if !hash_calc_totals_enabled() {
+        return;
+    }
+    HASH_CALC_TOTALS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        stats.poseidon = stats.poseidon.saturating_add(1);
+    });
+    HASH_CALC_UNIQUES.with(|uniques| {
+        uniques.borrow_mut().poseidon.insert(values.to_vec());
+    });
+}
+
+#[inline]
+pub fn record_sn_keccak_calc(values: &[u64]) {
+    if !hash_calc_totals_enabled() {
+        return;
+    }
+    HASH_CALC_TOTALS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        stats.sn_keccak = stats.sn_keccak.saturating_add(1);
+    });
+    HASH_CALC_UNIQUES.with(|uniques| {
+        uniques.borrow_mut().sn_keccak.insert(values.to_vec());
+    });
 }
 
 #[inline]
@@ -389,6 +495,7 @@ pub unsafe extern "C" fn cairo_native__libfunc__pedersen(
     // Convert to FieldElement.
     let lhs = Felt::from_bytes_le(&lhs);
     let rhs = Felt::from_bytes_le(&rhs);
+    record_pedersen_calc(lhs, rhs);
 
     let hash_logs_enabled = blockifier_hash_logs_enabled();
     let log_start = hash_log_start(hash_logs_enabled);
@@ -482,6 +589,7 @@ pub unsafe extern "C" fn cairo_native__libfunc__hades_permutation(
     let hash_logs_enabled = blockifier_hash_logs_enabled();
     let log_start = hash_log_start(hash_logs_enabled);
     let values_before = state;
+    record_poseidon_calc(&values_before);
 
     // Compute Poseidon permutation.
     let hash_start = if total_start.is_some() {

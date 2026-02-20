@@ -24,6 +24,7 @@ pub mod docs;
 pub mod error;
 pub mod execution_result;
 pub mod executor;
+pub mod hash_agg;
 mod ffi;
 mod libfuncs;
 pub mod metadata;

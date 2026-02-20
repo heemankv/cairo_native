@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
+use crate::hash_agg;
+
 pub type SyscallResult<T> = std::result::Result<T, Vec<Felt>>;
 
 #[repr(C)]
@@ -1419,6 +1421,7 @@ pub(crate) mod handler {
                 }
             };
 
+            hash_agg::record_sn_keccak_call(input_vec, false);
             let result = ptr.keccak(input_vec, gas);
             unsafe {
                 Self::drop_mlir_array(input);

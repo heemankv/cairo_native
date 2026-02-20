@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use crate::hash_agg;
 use crate::utils::BuiltinCosts;
 use cairo_lang_sierra_gas::core_libfunc_cost::{
     DICT_SQUASH_REPEATED_ACCESS_COST, DICT_SQUASH_UNIQUE_KEY_COST,
@@ -243,10 +244,12 @@ pub unsafe extern "C" fn cairo_native__libfunc__pedersen(
     // Convert to FieldElement.
     let lhs = Felt::from_bytes_le(&lhs);
     let rhs = Felt::from_bytes_le(&rhs);
+    hash_agg::record_pedersen_call(lhs, rhs);
     if *CAIRO_NATIVE_PEDERSEN_CACHE {
         // Fast path: cache hit. This keeps semantics identical and avoids repeated Pedersen work.
         // On a cache hit, hash_us is 0 (we didn't do the expensive hashing).
         if let Some(res) = PEDERSEN_CACHE.with(|cache| cache.borrow().get(&(lhs, rhs)).copied()) {
+            hash_agg::record_pedersen_cache_hit();
             *dst = res.to_bytes_le();
             if let Some(start) = total_start {
                 let total_us = start.elapsed().as_micros();
@@ -255,6 +258,7 @@ pub unsafe extern "C" fn cairo_native__libfunc__pedersen(
             return;
         }
     }
+    hash_agg::record_pedersen_cache_miss();
 
     // Compute pedersen hash and copy the result into `dst`.
     let hash_start = if total_start.is_some() {
@@ -315,6 +319,7 @@ pub unsafe extern "C" fn cairo_native__libfunc__hades_permutation(
         Felt::from_bytes_le(op1),
         Felt::from_bytes_le(op2),
     ];
+    hash_agg::record_poseidon_call(&state);
 
 
     // Compute Poseidon permutation.

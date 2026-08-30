@@ -33,10 +33,7 @@ use std::{
     os::fd::FromRawFd,
     ptr::{self, null_mut},
     rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        LazyLock,
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
 use std::{ops::Mul, vec::IntoIter};
 
@@ -50,15 +47,15 @@ lazy_static! {
 }
 
 const PEDERSEN_CACHE_CAPACITY: usize = 8 * 1024;
-static PEDERSEN_CACHE_ENABLED: LazyLock<AtomicBool> = LazyLock::new(|| {
-    let enabled = std::env::var("CAIRO_NATIVE_PEDERSEN_CACHE").is_ok_and(|value| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    });
-    AtomicBool::new(enabled)
-});
+static PEDERSEN_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables native-runtime Pedersen memoization.
+///
+/// Configure this once during process startup, before native execution workers
+/// begin handling transactions.
+pub fn set_pedersen_cache_enabled(enabled: bool) {
+    PEDERSEN_CACHE_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 fn pedersen_cache_enabled() -> bool {
     PEDERSEN_CACHE_ENABLED.load(Ordering::Relaxed)
@@ -1134,16 +1131,16 @@ mod tests {
         let rhs = Felt::from(3);
         let expected = starknet_types_core::hash::Pedersen::hash(&lhs, &rhs);
 
-        PEDERSEN_CACHE_ENABLED.store(false, Ordering::Relaxed);
+        set_pedersen_cache_enabled(false);
         PEDERSEN_CACHE.with(|cache| cache.borrow_mut().clear());
         pedersen_cache_insert(lhs, rhs, expected);
         assert_eq!(pedersen_cache_get(lhs, rhs), None);
 
-        PEDERSEN_CACHE_ENABLED.store(true, Ordering::Relaxed);
+        set_pedersen_cache_enabled(true);
         pedersen_cache_insert(lhs, rhs, expected);
         assert_eq!(pedersen_cache_get(lhs, rhs), Some(expected));
 
-        PEDERSEN_CACHE_ENABLED.store(false, Ordering::Relaxed);
+        set_pedersen_cache_enabled(false);
         PEDERSEN_CACHE.with(|cache| cache.borrow_mut().clear());
     }
 

@@ -11,7 +11,7 @@
 pub use self::{
     compiler::compile,
     ffi::{module_to_object, object_to_shared_lib, OptLevel},
-    runtime::FormattedItem,
+    runtime::{set_pedersen_cache_enabled, FormattedItem},
     values::Value,
 };
 
